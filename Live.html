@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTC Caller Live</title>
+<style>
+body{margin:0;background:#171513;color:#efece6;font:16px/1.5 system-ui,-apple-system,sans-serif;padding:16px 14px 40px}
+h1{font-size:28px;margin:0}
+.mute{color:#a39d93;font-size:13px}
+.big{font-size:30px;font-weight:800}
+.card{background:#211f1c;border:1px solid #38342f;border-radius:14px;padding:16px;margin-top:14px}
+.verdict{font-size:48px;font-weight:800;line-height:1;margin:8px 0}
+.up{color:#4cc287}.dn{color:#ff6b4f}.wait{color:#cfc8bd}
+.btn{font:inherit;font-weight:600;min-height:44px;padding:0 14px;border-radius:10px;border:1px solid #38342f;background:#211f1c;color:#efece6}
+.btn.on{background:#efece6;color:#171513}
+input{width:100%;font-size:16px;padding:8px;border-radius:10px;border:1px solid #38342f;background:#171513;color:#efece6}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td,th{padding:6px 4px;border-bottom:1px solid #38342f;text-align:right}
+td:first-child,th:first-child{text-align:left}
+</style>
+</head>
+<body>
+<h1>BTC Caller Live</h1>
+<div class="mute">Polymarket 5m and 15m rounds. Calls only, you place the bet.</div>
+<div style="margin-top:10px"><span class="mute">BTC now</span><div class="big" id="btc">--</div></div>
+<button class="btn" id="sound">Sound off</button>
+<div class="mute" id="status" style="margin-top:8px">Starting…</div>
+<div id="cards"></div>
+<div class="card">
+<b>Call log</b> <span class="mute" id="info"></span>
+<div id="score" style="margin:8px 0"></div>
+<table><thead><tr><th>Time</th><th>Rd</th><th>Call</th><th>Paid</th><th>Result</th><th>P/L</th></tr></thead><tbody id="log"></tbody></table>
+<button class="btn" id="clear" style="margin-top:10px">Clear log</button>
+</div>
+<script>
+{
+const PROXY='https://shiny-snowflake-7c83.isouljatoy.workers.dev/?url=';
+const CB='https://api.exchange.coinbase.com/products/BTC-USD';
+const FEE=0.02,MIN_EDGE=0.05,MAX_PRICE=0.90,KEY='btcLive.log.v1';
+const $=id=>document.getElementById(id);
+const R={'5m':{len:300},'15m':{len:900}};
+let price=null,sigma=null,sigmaAt=0,ctx=null,log=[];
+try{log=JSON.parse(localStorage.getItem(KEY)||'[]')}catch(e){}
+const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(log))}catch(e){}};
+const nowS=()=>Math.floor(Date.now()/1000);
+const fmtT=s=>Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
+async function getJSON(url){
+ if(url.includes('polymarket.com'))url=PROXY+encodeURIComponent(url);
+ const r=await fetch(url);if(!r.ok)throw new Error('HTTP '+r.status);return r.json();
+}
+async function candles(s,e){
+ const iso=t=>new Date(t*1000).toISOString();
+ const d=await getJSON(CB+'/candles?granularity=60&start='+iso(s)+'&end='+iso(e));
+ return d.sort((a,b)=>a[0]-b[0]);
+}
+async function openAt(ts){const c=(await candles(ts,ts+60)).find(x=>x[0]===ts);return c?c[3]:null}
+async function bestAsk(id){
+ const b=await getJSON('https://clob.polymarket.com/book?token_id='+id);
+ const a=(b.asks||[]).filter(x=>+x.size>0).map(x=>+x.price);
+ return a.length?Math.min(...a):null;
+}
+async function findMarket(tf,t0){
+ const ev=await getJSON('https://gamma-api.polymarket.com/events?slug=btc-updown-'+tf+'-'+t0);
+ if(!ev.length)return null;
+ const m=ev[0].markets[0],ids=JSON.parse(m.clobTokenIds);
+ const outs=JSON.parse(m.outcomes||'["Up","Down"]').map(o=>o.toLowerCase());
+ return{up:ids[outs.indexOf('up')]??ids[0],down:ids[outs.indexOf('down')]??ids[1]};
+}
+function erf(x){const t=1/(1+0.3275911*Math.abs(x));const y=1-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*Math.exp(-x*x);return x>=0?y:-y}
+function probUp(p,T,s){
+ if(s<=0||!sigma)return p>=T?1:0;
+ const z=(p-T)/(sigma*Math.sqrt(s/60));
+ return 0.5+(0.5*(1+erf(z/Math.SQRT2))-0.5)*0.9;
+}
+function beep(){if(!ctx)return;const o=ctx.createOscillator(),g=ctx.createGain();o.frequency.value=1100;g.gain.value=0.25;o.connect(g);g.connect(ctx.destination);o.start();o.stop(ctx.currentTime+0.35)}
+$('cards').innerHTML=Object.keys(R).map(tf=>`<div class="card"><div class="mute">${tf} round · <b id="clk${tf}">--</b> left</div><div class="verdict wait" id="v${tf}">WAIT</div><div id="why${tf}">Loading…</div><div class="mute" id="kv${tf}" style="margin-top:8px"></div></div>`).join('');
+function show(tf,w,c,why){const v=$('v'+tf);v.textContent=w;v.className='verdict '+c;$('why'+tf).textContent=why}
+async function tick(){
+ const now=nowS();
+ try{
+  price=+(await getJSON(CB+'/ticker')).price;
+  $('btc').textContent='$'+price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+  if(now-sigmaAt>=60){const c=await candles(now-3600,now),m=[];for(let i=1;i<c.length;i++)m.push(c[i][4]-c[i-1][4]);if(m.length>5){const a=m.reduce((x,y)=>x+y,0)/m.length;sigma=Math.sqrt(m.reduce((x,y)=>x+(y-a)**2,0)/m.length);sigmaAt=now}}
+  $('status').textContent='Live · '+new Date().toLocaleTimeString()+' · BTC moving about $'+(sigma?sigma.toFixed(0):'--')+'/min';
+ }catch(e){$('status').textContent='BTC feed failed, retrying…';return}
+ for(const tf of Object.keys(R)){
+  const r=R[tf],t0=now-now%r.len,left=t0+r.len-now;
+  if(r.t0!==t0)Object.assign(r,{t0,market:undefined,target:null,called:false});
+  $('clk'+tf).textContent=fmtT(left);
+  try{if(r.target==null)r.target=await openAt(t0)}catch(e){}
+  let up=null,dn=null;
+  try{if(r.market===undefined)r.market=await findMarket(tf,t0);if(r.market)[up,dn]=await Promise.all([bestAsk(r.market.up),bestAsk(r.market.down)])}catch(e){r.market=undefined}
+  if(!r.target||!sigma||up==null||dn==null){show(tf,'WAIT','wait',up==null?'Polymarket prices not loading yet…':'Waiting for data…');continue}
+  const p=probUp(price,r.target,left);
+  const eu=p-(up+FEE),ed=(1-p)-(dn+FEE);
+  const b=eu>=ed?{s:'UP',o:p,c:up,e:eu}:{s:'DOWN',o:1-p,c:dn,e:ed};
+  $('kv'+tf).innerHTML='Target $'+r.target.toFixed(2)+' ('+(price-r.target>=0?'+':'')+(price-r.target).toFixed(2)+')<br>Bot: UP '+(p*100).toFixed(0)+'% · DOWN '+(100-p*100).toFixed(0)+'%<br>Price: UP '+(up*100).toFixed(0)+'¢ · DOWN '+(dn*100).toFixed(0)+'¢';
+  let why='';
+  if(left<=30)why='Under 30 seconds left. Sit out.';
+  else if(now-t0<30)why='Round just opened. Waiting.';
+  else if(b.c>MAX_PRICE)why=b.s+' costs '+(b.c*100).toFixed(0)+'¢. Not worth it.';
+  else if(b.e<MIN_EDGE)why='No edge right now. Skip.';
+  if(why){show(tf,r.called?'CALLED':'WAIT','wait',r.called?'Already called. See log.':why);continue}
+  const max=Math.floor((b.o-FEE-MIN_EDGE)*100);
+  show(tf,'CALL '+b.s,b.s==='UP'?'up':'dn','Buy '+b.s+' at '+max+'¢ or less. Bot says '+(b.o*100).toFixed(0)+'%, market charges '+(b.c*100).toFixed(0)+'¢.');
+  if(!r.called){r.called=true;beep();log.push({t:Date.now(),tf,side:b.s,price:b.c,target:r.target,tEnd:t0+r.len,result:null});save();render()}
+ }
+ for(const e of log){
+  if(e.result||now<e.tEnd+90)continue;
+  try{const c=await openAt(e.tEnd);if(c!=null){e.result=((c>=e.target)===(e.side==='UP'))?'W':'L';save();render()}}catch(x){}
+ }
+}
+const pl=e=>e.result==='W'?1-e.price-FEE:e.result==='L'?-(e.price+FEE):0;
+function render(){
+ const d=log.filter(e=>e.result),w=d.filter(e=>e.result==='W').length,net=d.reduce((a,e)=>a+pl(e),0);
+ $('info').textContent=d.length+'/100 graded';
+ $('score').innerHTML=d.length?'<b>'+w+'W · '+(d.length-w)+'L</b> · '+Math.round(w/d.length*100)+'% right · net <b class="'+(net>=0?'up':'dn')+'">'+(net>=0?'+':'')+(net*100).toFixed(0)+'¢</b>':'<span class="mute">No graded calls yet.</span>';
+ $('log').innerHTML=log.slice().reverse().map(e=>'<tr><td>'+new Date(e.t).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})+'</td><td>'+e.tf+'</td><td class="'+(e.side==='UP'?'up':'dn')+'">'+e.side+'</td><td>'+(e.price*100).toFixed(0)+'¢</td><td>'+(e.result||'…')+'</td><td>'+(e.result?(pl(e)*100).toFixed(0)+'¢':'')+'</td></tr>').join('');
+}
+$('sound').onclick=()=>{try{if(!ctx)ctx=new(window.AudioContext||window.webkitAudioContext)();else{ctx.close();ctx=null}}catch(e){}$('sound').textContent=ctx?'Sound on':'Sound off';$('sound').classList.toggle('on',!!ctx);beep()};
+let arm=false;
+$('clear').onclick=()=>{if(!arm){arm=true;$('clear').textContent='Tap again to clear';setTimeout(()=>{arm=false;$('clear').textContent='Clear log'},3000);return}log=[];save();render();arm=false;$('clear').textContent='Clear log'};
+render();
+let busy=false;
+setInterval(async()=>{if(busy)return;busy=true;try{await tick()}finally{busy=false}},5000);
+tick();
+}
+</script>
+</body>
+</html>
