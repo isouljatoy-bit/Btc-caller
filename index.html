@@ -299,5 +299,144 @@ const loop = async () => { if (busy) return; busy = true; try { await tick(); } 
 loop(); setInterval(loop, 5000);
 }
 </script>
+<div id="bx-wrap" style="background:#0e1117;color:#ddd;font-family:sans-serif;padding:10px;border-radius:8px;margin:10px 0">
+  <h3 style="margin:4px 0">BTC/USD Box Breakout (15m)</h3>
+  <div style="display:flex;flex-wrap:wrap;gap:10px">
+    <div style="flex:3;min-width:280px">
+      <div id="bx-chart" style="height:380px"></div>
+      <div id="bx-rsi" style="height:140px;margin-top:6px"></div>
+    </div>
+    <div style="flex:1;min-width:200px;max-height:530px;overflow-y:auto;background:#161b22;border-radius:6px;padding:8px">
+      <b>Signals</b>
+      <div id="bx-list" style="font-size:13px;margin-top:6px">Loading...</div>
+    </div>
+  </div>
+  <div id="bx-status" style="font-size:11px;color:#888;margin-top:6px"></div>
+</div>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+(function () {
+  var LOOKBACK = 20;   // candles that make the box
+  var RSI_LEN = 14;
+
+  var opts = {
+    layout: { background: { color: '#0e1117' }, textColor: '#ccc' },
+    grid: { vertLines: { color: '#1f2430' }, horzLines: { color: '#1f2430' } },
+    timeScale: { timeVisible: true, secondsVisible: false },
+    rightPriceScale: { borderColor: '#333' }
+  };
+
+  var chartEl = document.getElementById('bx-chart');
+  var rsiEl = document.getElementById('bx-rsi');
+
+  var chart = LightweightCharts.createChart(chartEl, Object.assign({ width: chartEl.clientWidth, height: 380 }, opts));
+  var candles = chart.addCandlestickSeries({
+    upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
+    wickUpColor: '#26a69a', wickDownColor: '#ef5350'
+  });
+  var boxTop = chart.addLineSeries({ color: '#2962ff', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false });
+  var boxBot = chart.addLineSeries({ color: '#ff9800', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false });
+
+  var rsiChart = LightweightCharts.createChart(rsiEl, Object.assign({ width: rsiEl.clientWidth, height: 140 }, opts));
+  var rsiLine = rsiChart.addLineSeries({ color: '#ab47bc', lineWidth: 2, priceLineVisible: false });
+  rsiLine.createPriceLine({ price: 70, color: '#ef5350', lineStyle: 2, lineWidth: 1, axisLabelVisible: true });
+  rsiLine.createPriceLine({ price: 30, color: '#26a69a', lineStyle: 2, lineWidth: 1, axisLabelVisible: true });
+
+  chart.timeScale().subscribeVisibleLogicalRangeChange(function (r) {
+    if (r) rsiChart.timeScale().setVisibleLogicalRange(r);
+  });
+
+  function calcRsi(closes, len) {
+    var out = [], g = 0, l = 0;
+    for (var i = 1; i < closes.length; i++) {
+      var d = closes[i] - closes[i - 1];
+      var up = d > 0 ? d : 0, dn = d < 0 ? -d : 0;
+      if (i <= len) {
+        g += up; l += dn;
+        if (i === len) { g /= len; l /= len; out[i] = l === 0 ? 100 : 100 - 100 / (1 + g / l); }
+      } else {
+        g = (g * (len - 1) + up) / len;
+        l = (l * (len - 1) + dn) / len;
+        out[i] = l === 0 ? 100 : 100 - 100 / (1 + g / l);
+      }
+    }
+    return out;
+  }
+
+  function fmt(t) {
+    return new Date(t * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  }
+
+  function load() {
+    fetch('https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=900')
+      .then(function (r) { return r.json(); })
+      .then(function (raw) {
+        var d = raw.map(function (c) {
+          return { time: c[0], low: c[1], high: c[2], open: c[3], close: c[4] };
+        }).sort(function (a, b) { return a.time - b.time; });
+
+        candles.setData(d);
+
+        var tops = [], bots = [], markers = [], sigs = [], last = '';
+        for (var i = LOOKBACK; i < d.length; i++) {
+          var hi = -Infinity, lo = Infinity;
+          for (var j = i - LOOKBACK; j < i; j++) {
+            if (d[j].high > hi) hi = d[j].high;
+            if (d[j].low < lo) lo = d[j].low;
+          }
+          tops.push({ time: d[i].time, value: hi });
+          bots.push({ time: d[i].time, value: lo });
+
+          if (d[i].close > hi && last !== 'BUY') {
+            markers.push({ time: d[i].time, position: 'belowBar', color: '#26a69a', shape: 'arrowUp', text: 'BUY' });
+            sigs.push({ type: 'BUY', price: d[i].close, time: d[i].time });
+            last = 'BUY';
+          } else if (d[i].close < lo && last !== 'SELL') {
+            markers.push({ time: d[i].time, position: 'aboveBar', color: '#ef5350', shape: 'arrowDown', text: 'SELL' });
+            sigs.push({ type: 'SELL', price: d[i].close, time: d[i].time });
+            last = 'SELL';
+          }
+        }
+        boxTop.setData(tops);
+        boxBot.setData(bots);
+        candles.setMarkers(markers);
+
+        var closes = d.map(function (c) { return c.close; });
+        var r = calcRsi(closes, RSI_LEN), rsiData = [];
+        for (var k = 0; k < d.length; k++) {
+          if (r[k] !== undefined) rsiData.push({ time: d[k].time, value: r[k] });
+        }
+        rsiLine.setData(rsiData);
+
+        var html = '';
+        sigs.slice().reverse().slice(0, 30).forEach(function (s) {
+          var col = s.type === 'BUY' ? '#26a69a' : '#ef5350';
+          html += '<div style="padding:5px 0;border-bottom:1px solid #222">' +
+            '<span style="color:' + col + ';font-weight:bold">' + s.type + '</span> $' +
+            s.price.toLocaleString(undefined, { maximumFractionDigits: 2 }) +
+            '<br><span style="color:#888">' + fmt(s.time) + '</span></div>';
+        });
+        document.getElementById('bx-list').innerHTML = html || 'No signals yet';
+
+        var lastC = d[d.length - 1];
+        document.getElementById('bx-status').textContent =
+          'Price $' + lastC.close.toLocaleString() + ' | RSI ' +
+          (rsiData.length ? rsiData[rsiData.length - 1].value.toFixed(1) : '-') +
+          ' | Updated ' + new Date().toLocaleTimeString();
+      })
+      .catch(function (e) {
+        document.getElementById('bx-status').textContent = 'Could not load BTC data: ' + e;
+      });
+  }
+
+  window.addEventListener('resize', function () {
+    chart.applyOptions({ width: chartEl.clientWidth });
+    rsiChart.applyOptions({ width: rsiEl.clientWidth });
+  });
+
+  load();
+  setInterval(load, 60000);
+})();
+</script>
 </body>
 </html>
