@@ -45,7 +45,7 @@ details summary{font-weight:600}
 </style>
 </head>
 <body>
-<h1>BTC Caller Pro <span class="badge" id="conn">connecting…</span></h1>
+<h1>BTC Caller Pro <span><span class="badge" id="online" style="display:none"></span> <span class="badge" id="conn">connecting…</span></span></h1>
 <div class="seg" id="modeSeg"><button data-m="5">5 MIN</button><button data-m="15">15 MIN</button></div>
 
 <div class="card">
@@ -84,6 +84,7 @@ details summary{font-weight:600}
 
 <div class="card">
   <div class="row"><b>Call log</b><span class="mut" id="statLine">–</span></div>
+  <div class="mut" id="shareTxt" style="margin-top:4px"></div>
   <div class="mut" id="stats" style="margin:6px 0"></div>
   <table><thead><tr><th>Time</th><th>Mkt</th><th>Side</th><th>Paid</th><th>Fair</th><th>Result</th></tr></thead><tbody id="logBody"></tbody></table>
   <div class="row" style="margin-top:10px;flex-wrap:wrap;justify-content:flex-start;gap:6px">
@@ -98,6 +99,8 @@ details summary{font-weight:600}
   <div class="grid" id="settings"></div>
   <label class="mut" style="display:block;margin-top:10px">Worker prefix for auto prices (optional)
     <input id="cfg_worker" style="width:100%;margin-top:4px" placeholder="https://your-worker.workers.dev/?url="></label>
+  <label class="mut" style="display:block;margin-top:10px">Owner key (only on YOUR phone — lets it publish the shared log)
+    <input id="cfg_ownerKey" type="password" style="width:100%;margin-top:4px" placeholder="leave empty on viewer phones"></label>
   <button class="btn" id="saveCfg" style="margin-top:10px">Save settings</button>
 </details></div>
 <div class="mut" style="text-align:center">Signals use Coinbase prices. Polymarket settles on Chainlink, so very close calls can differ. Not financial advice.</div>
@@ -108,7 +111,7 @@ const store = {
   get(k, d){ try{ const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); }catch(e){ return d; } },
   set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
 };
-const DEFAULTS = { worker:'https://shiny-snowflake-7c83.isouljatoy.workers.dev/?url=', distMult:1.0, momSec:30, probMin:0.75, maxLeft5:120, maxLeft15:300, lockSec:60, boxLen:6, edgeMin:0.03, rsiLen:14 };
+const DEFAULTS = { ownerKey:'', worker:'https://shiny-snowflake-7c83.isouljatoy.workers.dev/?url=', distMult:1.0, momSec:30, probMin:0.75, maxLeft5:120, maxLeft15:300, lockSec:60, boxLen:6, edgeMin:0.03, rsiLen:14 };
 const FIELDS = [
   ['distMult','Distance needed (× 1-min move)'],
   ['momSec','Momentum lookback (sec)'],
@@ -272,6 +275,61 @@ function evaluate(){
   return { side, diff, left, pUp, pSide, checks, score, ask, edge, boxDir };
 }
 
+/* ---------- shared log (Cloudflare Worker + KV) ---------- */
+let viewing = false, pushTimer = null;
+const isOwner = () => !!(CFG.ownerKey && CFG.ownerKey.trim());
+const logUrl = () => { try{ return new URL(CFG.worker).origin + '/log'; }catch(e){ return null; } };
+const hhmm = () => new Date().toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
+function saveLog(){
+  if(viewing) return; // viewers never overwrite anything
+  store.set('log', log);
+  if(isOwner()){ clearTimeout(pushTimer); pushTimer = setTimeout(pushLog, 1500); }
+}
+async function pushLog(){
+  const u = logUrl(); if(!u) return;
+  try{
+    const r = await fetch(u, { method:'POST', headers:{ 'Content-Type':'application/json', 'X-Key':CFG.ownerKey.trim() }, body:JSON.stringify(log.slice(0, 500)) });
+    $('shareTxt').textContent = r.ok ? '🌐 Published · ' + hhmm() : r.status === 403 ? '⚠️ Wrong owner key' : '⚠️ Publish failed (' + r.status + ')';
+  }catch(e){ $('shareTxt').textContent = '⚠️ Publish failed'; }
+}
+async function pullLog(){
+  const u = logUrl(); if(!u) return;
+  try{
+    const r = await fetch(u, { cache:'no-store' });
+    if(!r.ok) throw new Error(r.status);
+    const remote = await r.json();
+    if(!Array.isArray(remote)) throw new Error('bad');
+    if(isOwner()){
+      viewing = false;
+      const have = new Set(log.map(x => x.key));
+      let added = false;
+      remote.forEach(x => { if(!have.has(x.key)){ log.push(x); added = true; } });
+      log.sort((a,b) => b.start - a.start);
+      if(added) renderLog();
+      saveLog();
+      $('shareTxt').textContent = '🌐 Owner · publishing';
+    } else {
+      viewing = true;
+      log = remote;
+      renderLog();
+      $('shareTxt').textContent = '🌐 Live shared results · ' + hhmm();
+    }
+  }catch(e){ if(!isOwner()) $('shareTxt').textContent = ''; }
+}
+
+/* ---------- who's online now ---------- */
+const myId = Math.random().toString(36).slice(2, 12);
+async function pingOnline(){
+  if(document.hidden) return;
+  let base; try{ base = new URL(CFG.worker).origin; }catch(e){ return; }
+  try{
+    const r = await fetch(base + '/online?id=' + myId, { cache:'no-store' });
+    if(!r.ok) throw new Error(r.status);
+    const j = await r.json();
+    if(typeof j.online === 'number'){ const el = $('online'); el.style.display = ''; el.textContent = '👁 ' + Math.max(1, j.online) + ' online'; }
+  }catch(e){}
+}
+
 /* ---------- logging ---------- */
 // Scores any finished call from Coinbase 1-min candles, so it still works after the phone slept
 let resolving = false;
@@ -297,20 +355,21 @@ async function resolveFromCandles(){
     }catch(err){}
   }
   resolving = false;
-  if(changed){ store.set('log', log); renderLog(); }
+  if(changed){ saveLog(); renderLog(); }
 }
 function logCall(r){
+  if(viewing) return false;
   const key = mode + '-' + win.start;
   if(log.some(x => x.key === key)) return false;
   log.unshift({ key, mode, start:win.start, end:win.start + M(), side:r.side, open:win.open,
     entry:lastPrice, fair:r.pSide, ask:r.ask, edge:r.edge, left:Math.round(r.left), result:null, close:null });
   if(log.length > 500) log.length = 500;
-  store.set('log', log);
+  saveLog();
   return true;
 }
 function fillAsk(r){
   const e = log.find(x => x.key === mode + '-' + win.start);
-  if(e && e.ask == null && r.ask != null){ e.ask = r.ask; e.edge = r.edge; store.set('log', log); }
+  if(e && e.ask == null && r.ask != null){ e.ask = r.ask; e.edge = r.edge; saveLog(); }
 }
 function resolvePending(tms){
   let changed = false;
@@ -327,9 +386,10 @@ function resolvePending(tms){
       changed = true;
     }
   }
-  if(changed){ store.set('log', log); renderLog(); }
+  if(changed){ saveLog(); renderLog(); }
 }
 function renderLog(){
+  $('clearBtn').style.display = viewing ? 'none' : '';
   const done = log.filter(x => x.result === 'win' || x.result === 'loss');
   const wins = done.filter(x => x.result === 'win').length;
   $('statLine').textContent = done.length ? wins + '/' + done.length + ' wins (' + Math.round(wins/done.length*100) + '%)' : 'no calls yet';
@@ -438,7 +498,7 @@ function drawRsi(){
 }
 
 /* ---------- render loop ---------- */
-let lastScore = 0;
+let lastScore = 0, alertKey = null;
 function render(){
   const r = evaluate();
   if(!r){ return; }
@@ -467,7 +527,9 @@ function render(){
     '<div><span class="' + (c.pass ? 'ok' : 'no') + '">' + (c.pass ? '✔' : '○') + ' ' + c.name + '</span><span class="mut">' + c.info + '</span></div>').join('');
 
   if(r.score === 5 && lastScore < 5){
-    if(logCall(r)){ beep(); $('sigCard').classList.remove('flash'); void $('sigCard').offsetWidth; $('sigCard').classList.add('flash'); renderLog(); }
+    const k = mode + '-' + win.start;
+    if(alertKey !== k){ alertKey = k; beep(); $('sigCard').classList.remove('flash'); void $('sigCard').offsetWidth; $('sigCard').classList.add('flash'); }
+    if(logCall(r)) renderLog();
   }
   if(r.score === 5) fillAsk(r);
   lastScore = r.score;
@@ -494,10 +556,12 @@ setRsiTf(rsiTf);
 $('settings').innerHTML = FIELDS.map(([k, label]) =>
   '<label>' + label + ' <input id="cfg_' + k + '" type="number" step="any" inputmode="decimal" value="' + CFG[k] + '"></label>').join('');
 $('cfg_worker').value = CFG.worker;
+$('cfg_ownerKey').value = CFG.ownerKey || '';
 $('saveCfg').onclick = () => {
   FIELDS.forEach(([k]) => { const v = parseFloat($('cfg_' + k).value); if(!isNaN(v)) CFG[k] = v; });
   CFG.worker = $('cfg_worker').value.trim();
-  store.set('cfg', CFG); refreshCandles(); $('saveCfg').textContent = 'Saved ✔';
+  CFG.ownerKey = $('cfg_ownerKey').value.trim();
+  store.set('cfg', CFG); refreshCandles(); viewing = false; log = store.get('log', []); renderLog(); pullLog(); $('saveCfg').textContent = 'Saved ✔';
   setTimeout(() => $('saveCfg').textContent = 'Save settings', 1500);
 };
 $('exportBtn').onclick = async () => {
@@ -507,7 +571,7 @@ $('exportBtn').onclick = async () => {
   const ta = $('csvOut'); ta.style.display = 'block'; ta.value = csv;
   try{ await navigator.clipboard.writeText(csv); $('exportBtn').textContent = 'Copied ✔'; }catch(e){ ta.select(); $('exportBtn').textContent = 'Select & copy below'; }
 };
-$('clearBtn').onclick = () => { if(confirm('Clear the whole call log?')){ log = []; store.set('log', log); renderLog(); } };
+$('clearBtn').onclick = () => { if(viewing) return; if(confirm('Clear the whole call log?')){ log = []; saveLog(); renderLog(); } };
 
 /* ---------- start ---------- */
 setMode(mode);
@@ -517,6 +581,11 @@ refreshCandles();
 setInterval(refreshCandles, 20000);
 setInterval(resolveFromCandles, 15000);
 setTimeout(resolveFromCandles, 2000);
+pullLog();
+pingOnline();
+setInterval(pingOnline, 30000);
+document.addEventListener('visibilitychange', () => { if(!document.hidden) pingOnline(); });
+setInterval(() => { if(!isOwner()) pullLog(); }, 30000);
 setInterval(refreshMarket, 5000);
 setInterval(render, 500);
 </script>
